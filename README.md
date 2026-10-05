@@ -25,7 +25,16 @@
 对已结算班次指定**修订与费率版本**核算（`POST /shifts/{id}/loss-accountings`）：用该修订
 **固化的归因段**按费率边界切分，以定点数逐段计算金额并按分四舍五入（0.5 分向上）后汇总，
 未匹配费率的分钟**单列待定价、不作零金额**；账（账头 + 切分明细）按（班次, 修订, 费率版本）
-**幂等固化**，后续费率发布或归因更正只产生新组合的账，**历史账不可改写**。
+**幂等固化**，后续费率发布或归因更正只产生新组合的账，**历史账不可改写**。车间还可按
+**生产批次追溯停机成本**（`POST /devices/{id}/loss-allocations`）：提交分摊单号、同一设备
+已固化损失账ID列表（**每班次最多一份账**）与一批"批次号 + 带时区整分钟半开生产窗口"
+（一批次一窗口、互不重叠），把账内定价/待定价切分明细按与窗口的**交集分钟**分配到各批次
+（窗口外归**未分配**）；定价片段已按分取整的金额按交集分钟占比以**最大余数法**分成整数分
+（先取整，余分按小数余数降序补足，同余数按批次号升序、未分配最后，各去向金额之和恒等于
+原片段金额），待定价只分分钟、不产生金额；分摊结果随单**固化**（各账、各去向按原因汇总的
+分钟和金额及来源明细），同单号同内容重试返回原结果（列表顺序不影响同内容判定）、异内容
+冲突，未知或跨设备账、同班次多账、非法窗口均**整单拒绝不留部分结果**，后续归因修订或
+费率发布不改历史分摊。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Docker Compose
 
@@ -158,6 +167,24 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
     未知修订 `404 REVISION_NOT_FOUND`、该设备未知费率版本 `404 RATE_VERSION_NOT_FOUND`；
     修订未固化明细（结构引入前的历史修订）→ `422 SEGMENTS_UNAVAILABLE`，
     不以当前状态推算；金额/区间/重叠/空表非法 → `422 RATE_ENTRY_INVALID`。
+- **生产批次成本分摊**（按设备）：`POST /devices/{id}/loss-allocations` 提交
+  `分摊单号 + 已固化损失账ID列表 + 批次列表（批次号 + 整分钟半开生产窗口）`：
+  - 账必须全部属于本设备且**每个班次最多一份账**；批次**一批次一窗口**、窗口互不重叠
+    （端点相接允许）；账ID列表与批次列表均非空且不重复；
+  - 账内每个定价/待定价切分片段按与各批次窗口的**交集分钟**分配，窗口外分钟归
+    **未分配**；定价片段的整数分按交集分钟占该片段分钟的比例以**最大余数法**分配：
+    先向下取整，余分按小数余数降序逐个补足，同余数按批次号升序、未分配最后，
+    各去向金额之和恒等于原片段金额；待定价片段只分分钟、不产生金额；
+  - 结果随单**固化**：各账、各去向（批次 / 未分配）按原因汇总的定价分钟、待定价分钟
+    与金额，以及逐片段的来源明细；后续归因修订或费率发布**不改历史分摊**；
+  - 同单号同内容重试返回原结果（`200`，`idempotent=true`；**列表顺序不影响同内容
+    判定**），同单号异内容 `409 ALLOCATION_CONFLICT`；未知账
+    `404 ACCOUNTING_NOT_FOUND`、跨设备账 `422 ACCOUNTING_DEVICE_MISMATCH`、
+    同班次多账 `422 DUPLICATE_SHIFT_ACCOUNTING`、批次窗口重叠
+    `422 BATCH_WINDOW_OVERLAP`、非法窗口/空列表/重复ID `422 VALIDATION_ERROR`
+    —— 均**整单拒绝**，不留下任何部分结果；
+  - `GET /devices/{id}/loss-allocations/{allocation_no}` 读取已固化分摊单，
+    未知单号 `404 ALLOCATION_NOT_FOUND`。
 
 ## API 一览
 
@@ -186,6 +213,8 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `GET` | `/devices/{device_id}/rate-versions/{version}` | 读取某版本完整费率表（未知版本 404） |
 | `POST` | `/shifts/{id}/loss-accountings` | 按（修订, 费率版本）核算停机损失并幂等固化（首次 201 / 重复 200；待定价分钟单列） |
 | `GET` | `/shifts/{id}/loss-accountings?revision=&rate_version=` | 列出班次已固化损失账（可过滤；历史账不可改写） |
+| `POST` | `/devices/{device_id}/loss-allocations` | 按生产批次追溯停机成本：已固化损失账按批次窗口分摊并随单固化（首次 201 / 同内容重试 200 / 异内容 409；非法整单拒绝） |
+| `GET` | `/devices/{device_id}/loss-allocations/{allocation_no}` | 读取设备下某单号的已固化分摊结果（未知单号 404） |
 | `GET` | `/health` | 健康检查 |
 
 原因枚举：`maintenance`（保养）、`failure`（故障）、`pending`（待判）。
@@ -214,6 +243,12 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | 422 | `SEGMENTS_UNAVAILABLE` | 对账/损失核算所选修订未固化归因明细（结构引入前的历史修订，当时裁定状态无法可靠还原），拒绝以当前状态推算 |
 | 404 | `RATE_VERSION_NOT_FOUND` | 该设备不存在指定费率版本（含用其他设备的版本号核算本设备班次） |
 | 422 | `RATE_ENTRY_INVALID` | 费率行非法：金额非十进制/为负/超 6 位小数、原因非法、区间缺时区/未对齐整分钟/倒置、同版本同原因重叠、空费率表；整批拒绝不留痕 |
+| 404 | `ACCOUNTING_NOT_FOUND` | 分摊单引用的损失账ID不存在；整单拒绝不留部分结果 |
+| 422 | `ACCOUNTING_DEVICE_MISMATCH` | 分摊单引用的损失账属于其他设备；整单拒绝 |
+| 422 | `DUPLICATE_SHIFT_ACCOUNTING` | 分摊单为同一班次选了多份账（每班次最多一份）；整单拒绝 |
+| 422 | `BATCH_WINDOW_OVERLAP` | 批次生产窗口重叠（端点相接允许）；整单拒绝 |
+| 409 | `ALLOCATION_CONFLICT` | 分摊单号已存在但内容不同（账ID列表或批次窗口不同；列表顺序不影响同内容判定） |
+| 404 | `ALLOCATION_NOT_FOUND` | 设备下不存在指定分摊单号 |
 
 ## 调用示例
 
@@ -920,6 +955,7 @@ curl -X POST http://localhost:8000/devices/CNC-01/downtime-reconciliation -H 'Co
 `POST /shifts/{shift_id}/loss-accountings` 请求体：`{"rate_version": N, "revision": M?}`
 （`revision` 缺省取该班次最新修订）。响应：
 
+- `id`：账ID（生产批次成本分摊按此引用已固化账）；
 - `totals`：合计 `amount`/`amount_cents`（逐段按分四舍五入后求和）、`priced_minutes`、
   `unpriced_minutes` 与按原因的 `by_reason`；
 - `priced_pieces`：每个按费率边界切出的定价段（`seg_no` 指回固化归因段、起止、分钟、
@@ -959,6 +995,7 @@ curl -X POST http://localhost:8000/shifts/1/loss-accountings \
 
 ```json
 {
+  "id": 1,
   "shift_id": 1, "device_id": "CNC-01", "revision": 1, "rate_version": 1,
   "idempotent": false,
   "totals": {
@@ -1012,6 +1049,138 @@ curl 'http://localhost:8000/shifts/1/loss-accountings?revision=1'
 # 未知版本（含用其他设备的版本号）→ 404 RATE_VERSION_NOT_FOUND
 # 结构引入前无固化明细的历史修订 → 422 SEGMENTS_UNAVAILABLE（不以当前状态推算）
 # 金额为负 / 超 6 位小数 / 同原因区间重叠 / 空表 → 422 RATE_ENTRY_INVALID
+```
+
+## 生产批次成本分摊（按批次窗口追溯停机成本）
+
+车间按生产批次追溯停机成本：`POST /devices/{device_id}/loss-allocations` 把一个分摊单
+（单号 + 同一设备的已固化损失账ID列表 + 一批"批次号 + 整分钟半开生产窗口"）落成分摊结果，
+把账内定价/待定价切分明细按与各批次窗口的**交集分钟**分配到各批次，窗口外归**未分配**。
+
+**请求体**
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `allocation_no` | 是 | 分摊单号（设备内唯一），用于幂等与冲突判定 |
+| `accounting_ids` | 是 | 已固化损失账ID列表（非空、不重复；账ID见损失核算响应的 `id` 字段）；须全部属于本设备，且**每个班次最多一份账** |
+| `batches` | 是 | 非空批次列表：`batch_no` + 带时区整分钟半开窗口 `[start, end)`；**一批次一窗口**（批次号不重复）、窗口互不重叠（端点相接允许） |
+
+**分摊规则**
+
+- 账内每个切分片段按与各批次窗口的交集分钟分配，窗口外分钟归 `batch_no=null` 的
+  **未分配**去向；各去向分钟之和恒等于片段分钟；
+- 定价片段的金额（已按分取整的整数分）按交集分钟占该片段分钟的比例分配：**先向下取整，
+  余分按小数余数降序逐个补足；同余数按批次号升序、未分配最后**；各去向金额之和恒等于
+  原片段金额（整数分守恒，全程整数运算）；
+- 待定价片段只分分钟（`amount_cents=null`），不产生金额；
+- 结果随单**固化**：各账、各去向按原因汇总的定价/待定价分钟与金额（`destinations`），
+  以及逐片段的来源明细（`pieces[].shares`）；后续归因修订或费率发布**不改历史分摊**；
+- 同单号同内容重试返回原结果（`200`，`idempotent=true`；账ID列表与批次列表的**顺序
+  不影响**同内容判定），同单号异内容 `409 ALLOCATION_CONFLICT`；
+- 未知账 `404 ACCOUNTING_NOT_FOUND`、跨设备账 `422 ACCOUNTING_DEVICE_MISMATCH`、
+  同班次多账 `422 DUPLICATE_SHIFT_ACCOUNTING`、批次窗口重叠 `422 BATCH_WINDOW_OVERLAP`、
+  非法窗口/空列表/重复ID `422 VALIDATION_ERROR` —— 均**整单拒绝**，不留下任何部分结果。
+
+**调用示例**（接上文损失核算示例：账 `id=1` 为班次 1 修订 1 × 费率版本 1，定价片段为
+故障 10:00–10:30 @1.5 元 = 45.00、故障 10:30–11:00 @1 元 = 30.00、
+保养 11:00–11:30 @2 元 = 60.00、故障 11:30–12:00 @0.005 元 = 0.15，合计 135.15 元）
+
+```bash
+# 1) 提交分摊单：批次 B-AM 09:30–10:45、B-PM 10:45–11:45（+08:00）
+curl -X POST http://localhost:8000/devices/CNC-01/loss-allocations \
+  -H 'Content-Type: application/json' \
+  -d '{"allocation_no":"ALLOC-20261001-001","accounting_ids":[1],
+       "batches":[
+         {"batch_no":"B-AM","start":"2026-10-01T09:30:00+08:00","end":"2026-10-01T10:45:00+08:00"},
+         {"batch_no":"B-PM","start":"2026-10-01T10:45:00+08:00","end":"2026-10-01T11:45:00+08:00"}]}'
+# 201
+```
+
+```json
+{
+  "device_id": "CNC-01",
+  "allocation_no": "ALLOC-20261001-001",
+  "idempotent": false,
+  "batches": [
+    {"batch_no": "B-AM", "start": "2026-10-01T01:30:00Z", "end": "2026-10-01T02:45:00Z"},
+    {"batch_no": "B-PM", "start": "2026-10-01T02:45:00Z", "end": "2026-10-01T03:45:00Z"}
+  ],
+  "accountings": [{
+    "accounting_id": 1, "shift_id": 1, "revision": 1, "rate_version": 1,
+    "destinations": [
+      {"batch_no": "B-AM",
+       "totals": {"priced_minutes": 45, "unpriced_minutes": 0, "amount": "60.00", "amount_cents": 6000},
+       "by_reason": [
+         {"reason": "maintenance", "priced_minutes": 0, "unpriced_minutes": 0, "amount": "0.00", "amount_cents": 0},
+         {"reason": "failure", "priced_minutes": 45, "unpriced_minutes": 0, "amount": "60.00", "amount_cents": 6000},
+         {"reason": "pending", "priced_minutes": 0, "unpriced_minutes": 0, "amount": "0.00", "amount_cents": 0}]},
+      {"batch_no": "B-PM",
+       "totals": {"priced_minutes": 60, "unpriced_minutes": 0, "amount": "75.08", "amount_cents": 7508},
+       "by_reason": [
+         {"reason": "maintenance", "priced_minutes": 30, "unpriced_minutes": 0, "amount": "60.00", "amount_cents": 6000},
+         {"reason": "failure", "priced_minutes": 30, "unpriced_minutes": 0, "amount": "15.08", "amount_cents": 1508},
+         {"reason": "pending", "priced_minutes": 0, "unpriced_minutes": 0, "amount": "0.00", "amount_cents": 0}]},
+      {"batch_no": null,
+       "totals": {"priced_minutes": 15, "unpriced_minutes": 0, "amount": "0.07", "amount_cents": 7},
+       "by_reason": [
+         {"reason": "maintenance", "priced_minutes": 0, "unpriced_minutes": 0, "amount": "0.00", "amount_cents": 0},
+         {"reason": "failure", "priced_minutes": 15, "unpriced_minutes": 0, "amount": "0.07", "amount_cents": 7},
+         {"reason": "pending", "priced_minutes": 0, "unpriced_minutes": 0, "amount": "0.00", "amount_cents": 0}]}
+    ],
+    "pieces": [
+      {"piece_no": 1, "start": "2026-10-01T02:00:00Z", "end": "2026-10-01T02:30:00Z",
+       "minutes": 30, "reason": "failure", "priced": true,
+       "rate_per_minute": "1.5", "amount_cents": 4500,
+       "shares": [{"batch_no": "B-AM", "minutes": 30, "amount_cents": 4500}]},
+      {"piece_no": 2, "start": "2026-10-01T02:30:00Z", "end": "2026-10-01T03:00:00Z",
+       "minutes": 30, "reason": "failure", "priced": true,
+       "rate_per_minute": "1", "amount_cents": 3000,
+       "shares": [{"batch_no": "B-AM", "minutes": 15, "amount_cents": 1500},
+                  {"batch_no": "B-PM", "minutes": 15, "amount_cents": 1500}]},
+      {"piece_no": 3, "start": "2026-10-01T03:00:00Z", "end": "2026-10-01T03:30:00Z",
+       "minutes": 30, "reason": "maintenance", "priced": true,
+       "rate_per_minute": "2", "amount_cents": 6000,
+       "shares": [{"batch_no": "B-PM", "minutes": 30, "amount_cents": 6000}]},
+      {"piece_no": 4, "start": "2026-10-01T03:30:00Z", "end": "2026-10-01T04:00:00Z",
+       "minutes": 30, "reason": "failure", "priced": true,
+       "rate_per_minute": "0.005", "amount_cents": 15,
+       "shares": [{"batch_no": "B-PM", "minutes": 15, "amount_cents": 8},
+                  {"batch_no": null, "minutes": 15, "amount_cents": 7}]}
+    ]
+  }],
+  "created_at": "..."
+}
+```
+
+> 片段 4 的 15 分按 15/15 分钟分两份：各取整 7 分、余 1 分；两者小数余数相同，
+> 按"批次号升序、未分配最后"补给 B-PM → 8 分，未分配 7 分；8 + 7 = 15 分守恒。
+> 各去向金额合计 6000 + 7508 + 7 = 13515 分 = 账合计 135.15 元。
+> 若账中含待定价片段（如费率版本未覆盖某原因），其分钟照常按窗口分配，
+> 但 `amount_cents` 为 `null`、不产生金额。
+
+```bash
+# 2) 同单号同内容重试（账ID/批次列表乱序也算同内容）→ 200，idempotent=true，内容一致
+curl -X POST http://localhost:8000/devices/CNC-01/loss-allocations \
+  -H 'Content-Type: application/json' \
+  -d '{"allocation_no":"ALLOC-20261001-001","accounting_ids":[1],
+       "batches":[
+         {"batch_no":"B-PM","start":"2026-10-01T10:45:00+08:00","end":"2026-10-01T11:45:00+08:00"},
+         {"batch_no":"B-AM","start":"2026-10-01T09:30:00+08:00","end":"2026-10-01T10:45:00+08:00"}]}'
+
+# 3) 同单号异内容 → 409 ALLOCATION_CONFLICT
+curl -X POST http://localhost:8000/devices/CNC-01/loss-allocations \
+  -H 'Content-Type: application/json' \
+  -d '{"allocation_no":"ALLOC-20261001-001","accounting_ids":[1],
+       "batches":[{"batch_no":"B-AM","start":"2026-10-01T09:30:00+08:00","end":"2026-10-01T10:46:00+08:00"}]}'
+
+# 4) 读取已固化分摊单（之后再有归因修订/新费率版本/新账，本结果不变）
+curl http://localhost:8000/devices/CNC-01/loss-allocations/ALLOC-20261001-001
+
+# 错误示例
+# 未知账 → 404 ACCOUNTING_NOT_FOUND；跨设备账 → 422 ACCOUNTING_DEVICE_MISMATCH
+# 同班次多份账 → 422 DUPLICATE_SHIFT_ACCOUNTING；批次窗口重叠 → 422 BATCH_WINDOW_OVERLAP
+# 窗口缺时区/未对齐整分钟/倒置、空列表、重复ID → 422 VALIDATION_ERROR
+# 以上均整单拒绝：单号不会留下任何部分结果，可修正后用同单号重新提交
 ```
 
 ## 设计要点
@@ -1093,6 +1262,17 @@ curl 'http://localhost:8000/shifts/1/loss-accountings?revision=1'
   （跨设备版本号在服务层与外键双重拒绝）。核算持有**班次行锁 + 费率版本行锁**：
   发布与核算互不读到半成品，同组合并发核算唯一约束兜底为一个账（竞争方回滚后
   转幂等读取）；无固化明细的历史修订一律 `SEGMENTS_UNAVAILABLE` 拒绝，绝不推算。
+- **生产批次成本分摊**（`app/allocation.py`，纯标准库可独立测试）：分摊只读取不可变的
+  固化账与切分明细（`loss_accountings` / `loss_accounting_pieces`），结果（单头 +
+  批次窗口 + 引用账 + 各去向按原因汇总行 + 逐片段来源明细）**同事务一次写入、之后只读**，
+  后续归因修订或费率发布不改历史分摊。整数分按"交集分钟占片段分钟的比例"以
+  **最大余数法**分配（先取整，余分按小数余数降序、同余数批次号升序、未分配最后
+  逐个补足），各去向金额之和恒等于原片段金额，全程整数运算、结果与列表顺序无关。
+  内容哈希在规范化（账ID排序、批次按批次号排序、窗口时区归一为 UTC）后的内容上
+  计算，故列表顺序不影响同内容判定；写入持有**设备行锁**（与费率发布同一把锁），
+  `(设备, 单号)` 唯一约束兜底并发同单号为一个分摊单（竞争方回滚后转幂等读取或
+  冲突）；全部校验（未知/跨设备账、同班次多账、批次窗口重叠、非法窗口）先于任何
+  写入且单事务提交，故整单拒绝时不留部分结果。
 
 ## 项目结构
 
@@ -1103,6 +1283,7 @@ app/
   attribution.py  # 归因算法（半开区间运算，纯标准库）
   reconciliation.py # 现场-系统对账算法（裁剪/覆盖/差集，纯标准库）
   pricing.py      # 损失核算：定点金额、费率校验、按费率边界切分/逐段取整/待定价（纯标准库）
+  allocation.py   # 批次成本分摊：批次窗口校验、交集分钟分配、最大余数法整数分账（纯标准库）
   models.py       # SQLAlchemy 模型
   schemas.py      # Pydantic 请求/响应与校验
   db.py           # 引擎、会话、建库建表（含排他约束）
@@ -1120,6 +1301,8 @@ tests/
   test_downtime_reconciliation.py  # 现场停机对账（固定序号/最后修订明细并集/覆盖内外/未对账/序号越界与明细不可用）端到端测试（需 PostgreSQL）
   test_pricing.py               # 损失核算算法单测（定点金额/费率校验/边界切分/逐段取整/待定价合并，无外部依赖，可 python3 直接跑）
   test_loss_accounting.py       # 费率发布（连续版本/原子拒绝/并发）与损失核算（切分取整/待定价/幂等固化/历史不可改/跨设备/并发唯一）端到端测试（需 PostgreSQL）
+  test_allocation.py            # 批次分摊算法单测（最大余数法/交集与未分配/守恒/顺序无关，无外部依赖，可 python3 直接跑）
+  test_loss_allocation.py       # 生产批次成本分摊（分摊与守恒/幂等乱序/异内容冲突/整单拒绝不留痕/固化不改）端到端测试（需 PostgreSQL）
 scripts/smoke.sh         # 冒烟脚本
 Dockerfile / docker-compose.yml / requirements.txt
 ```

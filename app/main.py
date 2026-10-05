@@ -18,6 +18,13 @@ from .schemas import (
     AdjudicationAck,
     AdjudicationIn,
     AdjudicationOut,
+    AllocationAccountingOut,
+    AllocationBatchOut,
+    AllocationDestinationOut,
+    AllocationDestinationTotal,
+    AllocationPieceOut,
+    AllocationReasonTotal,
+    AllocationShareOut,
     ChangeEntry,
     ChangePage,
     DeviceCreate,
@@ -32,6 +39,8 @@ from .schemas import (
     EventVersionRef,
     LossAccountingIn,
     LossAccountingOut,
+    LossAllocationIn,
+    LossAllocationOut,
     LossReasonTotal,
     LossTotal,
     PricedPieceOut,
@@ -69,7 +78,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
@@ -95,6 +104,14 @@ app = FastAPI(
         "核算停机损失：以修订固化归因段按费率边界切分，定点数逐段四舍五入到分后"
         "汇总，未匹配费率的分钟单列待定价（不作零金额）；结果按"
         "（班次, 修订, 费率版本）幂等固化，历史账不可改写。"
+        "POST /devices/{device_id}/loss-allocations 按生产批次追溯停机成本："
+        "提交分摊单号、同一设备已固化损失账ID列表（每班次最多一份账）与一批"
+        "批次号+整分钟半开生产窗口（一批次一窗口、互不重叠），把账内定价/待定价"
+        "切分明细按与窗口的交集分钟分配到各批次（窗口外归未分配）；定价片段的"
+        "整数分按交集分钟占比以最大余数法分配（同余数按批次号升序、未分配最后，"
+        "各去向金额之和等于原片段金额），待定价只分分钟；结果随单固化"
+        "（各账、各去向按原因汇总的分钟和金额及来源明细），同单号同内容重试"
+        "返回原结果、异内容冲突，后续归因修订或费率发布不改历史分摊。"
     ),
     lifespan=lifespan,
 )
@@ -835,6 +852,7 @@ def _loss_accounting_out(accounting, pieces, idempotent: bool) -> LossAccounting
         if not p.priced
     ]
     return LossAccountingOut(
+        id=accounting.id,
         shift_id=accounting.shift_id,
         device_id=accounting.device_id,
         revision=accounting.revision,
@@ -902,3 +920,137 @@ def list_loss_accountings_route(
     """
     _shift, rows = services.list_loss_accountings(db, shift_id, revision, rate_version)
     return [_loss_accounting_out(accounting, pieces, True) for accounting, pieces in rows]
+
+
+# ---------------------------------------------------------------- 生产批次成本分摊
+
+
+def _loss_allocation_out(data: dict, idempotent: bool) -> LossAllocationOut:
+    accountings = []
+    for acc in data["accountings"]:
+        destinations = []
+        for dest in acc["destinations"]:
+            by_reason_map = dest["by_reason"]
+            by_reason = []
+            for reason in ("maintenance", "failure", "pending"):
+                line = by_reason_map.get(reason)
+                cents = line.amount_cents if line is not None else 0
+                by_reason.append(
+                    AllocationReasonTotal(
+                        reason=reason,
+                        priced_minutes=line.priced_minutes if line is not None else 0,
+                        unpriced_minutes=(
+                            line.unpriced_minutes if line is not None else 0
+                        ),
+                        amount=format_cents(cents),
+                        amount_cents=cents,
+                    )
+                )
+            total_cents = sum(r.amount_cents for r in by_reason)
+            destinations.append(
+                AllocationDestinationOut(
+                    batch_no=dest["batch_no"],
+                    totals=AllocationDestinationTotal(
+                        priced_minutes=sum(r.priced_minutes for r in by_reason),
+                        unpriced_minutes=sum(r.unpriced_minutes for r in by_reason),
+                        amount=format_cents(total_cents),
+                        amount_cents=total_cents,
+                    ),
+                    by_reason=by_reason,
+                )
+            )
+        pieces = [
+            AllocationPieceOut(
+                piece_no=p["piece_no"],
+                start=p["start"],
+                end=p["end"],
+                minutes=p["minutes"],
+                reason=p["reason"],
+                priced=p["priced"],
+                rate_per_minute=(
+                    format_micro(p["rate_per_minute_micro"])
+                    if p["rate_per_minute_micro"] is not None
+                    else None
+                ),
+                amount_cents=p["amount_cents"],
+                shares=[
+                    AllocationShareOut(
+                        batch_no=s.batch_no,
+                        minutes=s.minutes,
+                        amount_cents=s.amount_cents,
+                    )
+                    for s in p["shares"]
+                ],
+            )
+            for p in acc["pieces"]
+        ]
+        accountings.append(
+            AllocationAccountingOut(
+                accounting_id=acc["accounting_id"],
+                shift_id=acc["shift_id"],
+                revision=acc["revision"],
+                rate_version=acc["rate_version"],
+                destinations=destinations,
+                pieces=pieces,
+            )
+        )
+    return LossAllocationOut(
+        device_id=data["device_id"],
+        allocation_no=data["allocation_no"],
+        idempotent=idempotent,
+        batches=[
+            AllocationBatchOut(batch_no=b.batch_no, start=b.start_ts, end=b.end_ts)
+            for b in data["batches"]
+        ],
+        accountings=accountings,
+        created_at=data["created_at"],
+    )
+
+
+@app.post(
+    "/devices/{device_id}/loss-allocations",
+    response_model=LossAllocationOut,
+    tags=["loss-allocation"],
+)
+def create_loss_allocation(
+    device_id: str,
+    payload: LossAllocationIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """按生产批次追溯停机成本：把同一设备的已固化损失账分摊到各批次窗口。
+
+    - 提交分摊单号、已固化损失账ID列表（非空、不重复，**每班次最多一份账**）
+      与一批批次号+带时区整分钟半开生产窗口（**一批次一窗口、互不重叠**）；
+    - 账内定价/待定价切分明细按与各窗口的交集分钟分配，窗口外归「未分配」；
+      定价片段的整数分按交集分钟占比以**最大余数法**分配（先取整，余分按
+      小数余数降序补足，同余数按批次号升序、未分配最后），各去向金额之和
+      恒等于原片段金额；待定价片段只分分钟、不产生金额；
+    - 结果随单**固化**：各账、各去向按原因汇总的分钟和金额及来源明细，
+      后续归因修订或费率发布不改历史分摊；
+    - 同单号同内容重试返回原结果（200，idempotent=true；账ID列表与批次
+      列表的顺序不影响同内容判定），同单号异内容 409 ALLOCATION_CONFLICT；
+    - 未知账 404 ACCOUNTING_NOT_FOUND、跨设备账 422 ACCOUNTING_DEVICE_MISMATCH、
+      同班次多账 422 DUPLICATE_SHIFT_ACCOUNTING、批次窗口重叠
+      422 BATCH_WINDOW_OVERLAP、非法窗口/空列表/重复ID 422 VALIDATION_ERROR
+      —— 均整单拒绝，不留部分结果；未知设备 404 DEVICE_NOT_FOUND。
+    """
+    data, idempotent = services.allocate_loss(db, device_id, payload)
+    response.status_code = 200 if idempotent else 201
+    return _loss_allocation_out(data, idempotent)
+
+
+@app.get(
+    "/devices/{device_id}/loss-allocations/{allocation_no}",
+    response_model=LossAllocationOut,
+    tags=["loss-allocation"],
+)
+def get_loss_allocation(
+    device_id: str, allocation_no: str, db: Session = Depends(get_db)
+):
+    """读取设备下某单号的已固化分摊结果（历史分摊不可改写，随时重读一致）。
+
+    未知设备 404 DEVICE_NOT_FOUND、未知单号 404 ALLOCATION_NOT_FOUND。
+    """
+    data = services.get_loss_allocation(db, device_id, allocation_no)
+    return _loss_allocation_out(data, True)

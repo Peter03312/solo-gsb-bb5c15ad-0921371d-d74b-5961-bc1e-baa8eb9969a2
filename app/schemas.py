@@ -520,6 +520,7 @@ class UnpricedPieceOut(BaseModel):
 class LossAccountingOut(BaseModel):
     """按 (班次, 修订, 费率版本) 固化的停机损失账；同组合重复核算幂等返回。"""
 
+    id: int  # 账ID：生产批次成本分摊按此引用已固化账
     shift_id: int
     device_id: str
     revision: int
@@ -528,4 +529,115 @@ class LossAccountingOut(BaseModel):
     totals: LossTotal
     priced_pieces: list[PricedPieceOut]
     unpriced_pieces: list[UnpricedPieceOut]
+    created_at: datetime
+
+
+# ---------------------------------------------------------------- 生产批次成本分摊
+
+
+class AllocationBatchIn(_Interval):
+    """一个生产批次的整分钟半开生产窗口（一批次一窗口；批次窗口不得重叠）。"""
+
+    batch_no: str = Field(min_length=1, max_length=64, examples=["B-20261001-A"])
+
+
+class LossAllocationIn(BaseModel):
+    """按生产批次追溯停机成本的分摊单。
+
+    - accounting_ids：同一设备的已固化损失账ID列表（非空、不重复），
+      每个班次最多选一份账；
+    - batches：非空批次列表，一批次一窗口，窗口互不重叠（端点相接允许）；
+    - 同单号同内容重试返回原结果（列表顺序不影响同内容判定），异内容冲突。
+    """
+
+    allocation_no: str = Field(
+        min_length=1,
+        max_length=64,
+        description="分摊单号（设备内唯一），用于幂等与冲突判定",
+        examples=["ALLOC-20261001-001"],
+    )
+    accounting_ids: list[int] = Field(
+        min_length=1, description="已固化损失账ID列表（每班次最多一份账）"
+    )
+    batches: list[AllocationBatchIn] = Field(
+        min_length=1, description="批次号 + 整分钟半开生产窗口（一批次一窗口）"
+    )
+
+
+class AllocationBatchOut(BaseModel):
+    """分摊单固化的一个批次窗口（UTC 输出）。"""
+
+    batch_no: str
+    start: datetime
+    end: datetime
+
+
+class AllocationShareOut(BaseModel):
+    """一个切分片段分到一个去向的分钟与金额；batch_no 为 null 表示「未分配」。"""
+
+    batch_no: str | None  # null = 未分配（窗口外分钟）
+    minutes: int
+    amount_cents: int | None  # 待定价片段为 null（只分分钟，不产生金额）
+
+
+class AllocationPieceOut(BaseModel):
+    """来源明细：账内一个切分片段及其到各去向的分摊。"""
+
+    piece_no: int  # 账内切分明细号
+    start: datetime
+    end: datetime
+    minutes: int
+    reason: str
+    priced: bool
+    rate_per_minute: str | None  # 仅定价片段：每分钟费率（元，规范十进制）
+    amount_cents: int | None  # 仅定价片段：片段金额（分，已按分取整）
+    shares: list[AllocationShareOut]  # 各去向分钟之和=片段分钟；定价片段金额之和=片段金额
+
+
+class AllocationReasonTotal(BaseModel):
+    """某去向下某原因的汇总。"""
+
+    reason: str
+    priced_minutes: int
+    unpriced_minutes: int
+    amount: str  # 金额（元，两位小数字符串）
+    amount_cents: int  # 金额（分，整数）
+
+
+class AllocationDestinationTotal(BaseModel):
+    """某去向的合计（跨原因）。"""
+
+    priced_minutes: int
+    unpriced_minutes: int
+    amount: str
+    amount_cents: int
+
+
+class AllocationDestinationOut(BaseModel):
+    """某账在某去向（批次，或 null=未分配）按原因汇总的分钟与金额。"""
+
+    batch_no: str | None  # null = 未分配（窗口外分钟）
+    totals: AllocationDestinationTotal
+    by_reason: list[AllocationReasonTotal]  # 三类原因恒列出（无分钟则为零）
+
+
+class AllocationAccountingOut(BaseModel):
+    """分摊单中一份账的结果：各去向按原因汇总 + 来源明细。"""
+
+    accounting_id: int
+    shift_id: int
+    revision: int
+    rate_version: int
+    destinations: list[AllocationDestinationOut]  # 批次号升序，未分配最后
+    pieces: list[AllocationPieceOut]  # 按账内 piece_no 升序
+
+
+class LossAllocationOut(BaseModel):
+    """生产批次成本分摊结果（随单固化，后续归因修订/费率发布不改历史分摊）。"""
+
+    device_id: str
+    allocation_no: str
+    idempotent: bool  # True 表示同单号同内容重试，返回原结果
+    batches: list[AllocationBatchOut]  # 固化的批次窗口（按批次号升序）
+    accountings: list[AllocationAccountingOut]  # 按账ID升序
     created_at: datetime

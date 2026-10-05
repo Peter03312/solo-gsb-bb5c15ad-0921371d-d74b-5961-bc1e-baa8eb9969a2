@@ -395,3 +395,135 @@ class LossAccountingPiece(Base):
             name="ck_loss_pieces_priced_shape",
         ),
     )
+
+
+class LossAllocation(Base):
+    """生产批次成本分摊单（单头）：同设备单号唯一，内容哈希用于幂等判定。
+
+    - 同单号同内容重试返回原结果（账ID列表与批次列表的顺序不影响同内容
+      判定，内容哈希在规范化——排序、时区归一——后的内容上计算）；
+      同单号异内容冲突（409）；
+    - 分摊只引用不可变的固化账与其切分明细，结果随单头同事务固化：
+      后续归因修订或费率发布不改历史分摊。
+    """
+
+    __tablename__ = "loss_allocations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[str] = mapped_column(
+        ForeignKey("devices.id"), nullable=False, index=True
+    )
+    allocation_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 规范化内容（排序后的账ID列表 + 按批次号排序的批次窗口）的 sha256
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("device_id", "allocation_no", name="uq_loss_allocation_no"),
+    )
+
+
+class LossAllocationBatch(Base):
+    """分摊单的一个生产批次窗口（一批次一窗口；窗口互不重叠由服务层校验）。"""
+
+    __tablename__ = "loss_allocation_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    allocation_id: Mapped[int] = mapped_column(
+        ForeignKey("loss_allocations.id"), nullable=False, index=True
+    )
+    batch_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "allocation_id", "batch_no", name="uq_loss_allocation_batch"
+        ),
+        CheckConstraint("end_ts > start_ts", name="ck_alloc_batches_valid_range"),
+    )
+
+
+class LossAllocationAccounting(Base):
+    """分摊单引用的一份损失账（每班次至多一份账，由服务层校验）。"""
+
+    __tablename__ = "loss_allocation_accountings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    allocation_id: Mapped[int] = mapped_column(
+        ForeignKey("loss_allocations.id"), nullable=False, index=True
+    )
+    accounting_id: Mapped[int] = mapped_column(
+        ForeignKey("loss_accountings.id"), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "allocation_id", "accounting_id", name="uq_loss_allocation_accounting"
+        ),
+    )
+
+
+class LossAllocationLine(Base):
+    """分摊汇总行：某账在某去向（批次号，NULL=未分配）某原因的分钟与金额。
+
+    与单头同事务写入、之后只读；只存有分钟的去向/原因组合，
+    读取时按三类原因补零汇总。
+    """
+
+    __tablename__ = "loss_allocation_lines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    allocation_id: Mapped[int] = mapped_column(
+        ForeignKey("loss_allocations.id"), nullable=False, index=True
+    )
+    accounting_id: Mapped[int] = mapped_column(
+        ForeignKey("loss_accountings.id"), nullable=False
+    )
+    # 去向批次号；NULL 表示「未分配」（窗口外分钟）
+    batch_no: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reason: Mapped[str] = mapped_column(String(16), nullable=False)
+    priced_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    unpriced_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 金额（分）：仅定价分钟产生；待定价分钟恒贡献 0
+    amount_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "reason IN ('maintenance','failure','pending')",
+            name="ck_alloc_lines_reason",
+        ),
+        CheckConstraint(
+            "priced_minutes >= 0 AND unpriced_minutes >= 0 AND amount_cents >= 0",
+            name="ck_alloc_lines_non_negative",
+        ),
+    )
+
+
+class LossAllocationPiece(Base):
+    """分摊来源明细：某账某切分片段分到某去向（批次号，NULL=未分配）的分钟与金额。
+
+    (accounting_id, piece_no) 指向 loss_accounting_pieces 中不可变的原片段
+    （起止/原因/费率/原金额由该表承载）；待定价片段的 amount_cents 为 NULL
+    （只分分钟，不产生金额）。与单头同事务写入、之后只读。
+    """
+
+    __tablename__ = "loss_allocation_pieces"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    allocation_id: Mapped[int] = mapped_column(
+        ForeignKey("loss_allocations.id"), nullable=False, index=True
+    )
+    accounting_id: Mapped[int] = mapped_column(
+        ForeignKey("loss_accountings.id"), nullable=False
+    )
+    piece_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    batch_no: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("minutes > 0", name="ck_alloc_pieces_minutes"),
+    )

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→费率发布→停机损失核算 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→费率发布→停机损失核算→生产批次成本分摊 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -245,3 +245,40 @@ req GET "/shifts/1/loss-accountings?revision=1&rate_version=1"
 echo "-- 损失核算错误：未知费率版本 404 / 历史修订无明细 422 SEGMENTS_UNAVAILABLE / 未知班次 404 --"
 req POST /shifts/1/loss-accountings '{"revision":1,"rate_version":999}'
 req POST /shifts/9999/loss-accountings '{"rate_version":1}'
+
+echo "-- 生产批次成本分摊：取账ID（同组合重复核算幂等 200，响应含账ID id）--"
+ACC_ID="$(curl -sS -X POST "$BASE/shifts/1/loss-accountings" -H 'Content-Type: application/json' \
+  -d '{"revision":1,"rate_version":2}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')"
+ACC_ID2="$(curl -sS -X POST "$BASE/shifts/1/loss-accountings" -H 'Content-Type: application/json' \
+  -d '{"revision":1,"rate_version":1}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')"
+echo "账ID：$ACC_ID（修订1×费率版本2，含待定价）、$ACC_ID2（修订1×费率版本1）"
+
+echo "-- 分摊单 ALLOC-001：批次 B-AM 09:30-10:30、B-PM 10:30-11:30；定价片段按交集分钟占比分账，待定价只分分钟，窗口外归未分配 --"
+req POST /devices/CNC-01/loss-allocations '{"allocation_no":"ALLOC-001","accounting_ids":['"$ACC_ID"'],
+  "batches":[
+    {"batch_no":"B-AM","start":"2026-10-01T09:30:00+08:00","end":"2026-10-01T10:30:00+08:00"},
+    {"batch_no":"B-PM","start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T11:30:00+08:00"}]}'
+
+echo "-- 同单号同内容重试（批次列表乱序）：预期 200 幂等（idempotent=true），内容与原结果一致 --"
+req POST /devices/CNC-01/loss-allocations '{"allocation_no":"ALLOC-001","accounting_ids":['"$ACC_ID"'],
+  "batches":[
+    {"batch_no":"B-PM","start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T11:30:00+08:00"},
+    {"batch_no":"B-AM","start":"2026-10-01T09:30:00+08:00","end":"2026-10-01T10:30:00+08:00"}]}'
+
+echo "-- 同单号异内容：预期 409 ALLOCATION_CONFLICT --"
+req POST /devices/CNC-01/loss-allocations '{"allocation_no":"ALLOC-001","accounting_ids":['"$ACC_ID"'],
+  "batches":[{"batch_no":"B-AM","start":"2026-10-01T09:30:00+08:00","end":"2026-10-01T10:31:00+08:00"}]}'
+
+echo "-- 整单拒绝（不留部分结果）：批次窗口重叠 422 BATCH_WINDOW_OVERLAP / 同班次多账 422 DUPLICATE_SHIFT_ACCOUNTING / 未知账 404 ACCOUNTING_NOT_FOUND --"
+req POST /devices/CNC-01/loss-allocations '{"allocation_no":"ALLOC-002","accounting_ids":['"$ACC_ID"'],
+  "batches":[
+    {"batch_no":"B-1","start":"2026-10-01T09:00:00+08:00","end":"2026-10-01T10:00:00+08:00"},
+    {"batch_no":"B-2","start":"2026-10-01T09:30:00+08:00","end":"2026-10-01T10:30:00+08:00"}]}'
+req POST /devices/CNC-01/loss-allocations '{"allocation_no":"ALLOC-002","accounting_ids":['"$ACC_ID"','"$ACC_ID2"'],
+  "batches":[{"batch_no":"B-1","start":"2026-10-01T09:00:00+08:00","end":"2026-10-01T10:00:00+08:00"}]}'
+req POST /devices/CNC-01/loss-allocations '{"allocation_no":"ALLOC-002","accounting_ids":[999999],
+  "batches":[{"batch_no":"B-1","start":"2026-10-01T09:00:00+08:00","end":"2026-10-01T10:00:00+08:00"}]}'
+
+echo "-- 读取已固化分摊单（历史分摊不可改写）/ 未知单号 404 ALLOCATION_NOT_FOUND --"
+req GET /devices/CNC-01/loss-allocations/ALLOC-001
+req GET /devices/CNC-01/loss-allocations/NOPE
