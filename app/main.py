@@ -18,6 +18,11 @@ from .schemas import (
     AdjudicationAck,
     AdjudicationIn,
     AdjudicationOut,
+    AllocationAccountResult,
+    AllocationDestination,
+    AllocationReasonTotal,
+    AllocationSplitOut,
+    BatchWindowIn,
     ChangeEntry,
     ChangePage,
     DeviceCreate,
@@ -32,6 +37,8 @@ from .schemas import (
     EventVersionRef,
     LossAccountingIn,
     LossAccountingOut,
+    LossCostAllocationIn,
+    LossCostAllocationOut,
     LossReasonTotal,
     LossTotal,
     PricedPieceOut,
@@ -69,7 +76,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
@@ -94,7 +101,14 @@ app = FastAPI(
         "POST /shifts/{shift_id}/loss-accountings 对已结算班次指定修订与费率版本"
         "核算停机损失：以修订固化归因段按费率边界切分，定点数逐段四舍五入到分后"
         "汇总，未匹配费率的分钟单列待定价（不作零金额）；结果按"
-        "（班次, 修订, 费率版本）幂等固化，历史账不可改写。"
+        "（班次, 修订, 费率版本）幂等固化，历史账不可改写；"
+        "POST /devices/{device_id}/loss-cost-allocations 按生产批次追溯停机成本："
+        "提交同一设备的分摊单号、已固化损失账 id 列表与一批批次号-整分钟半开"
+        "生产窗口（每班次至多一份账、批次窗口互不重叠），按账内定价/待定价明细"
+        "与窗口的交集分摊分钟，窗口外归未分配；定价明细整数分按交集占比"
+        "先取整再按余数降序补足（同余数批次号升序、未分配最后），待定价只分分钟；"
+        "结果固化各账各去向按原因汇总的分钟金额及来源明细，同单号同内容重试幂等、"
+        "异内容冲突，非法输入整单拒绝。"
     ),
     lifespan=lifespan,
 )
@@ -835,6 +849,7 @@ def _loss_accounting_out(accounting, pieces, idempotent: bool) -> LossAccounting
         if not p.priced
     ]
     return LossAccountingOut(
+        id=accounting.id,
         shift_id=accounting.shift_id,
         device_id=accounting.device_id,
         revision=accounting.revision,
@@ -902,3 +917,198 @@ def list_loss_accountings_route(
     """
     _shift, rows = services.list_loss_accountings(db, shift_id, revision, rate_version)
     return [_loss_accounting_out(accounting, pieces, True) for accounting, pieces in rows]
+
+
+# ------------------------------------------------ 停机损失按生产批次分摊
+
+
+def _batch_windows_out(head) -> list[BatchWindowIn]:
+    return [
+        BatchWindowIn(
+            batch_no=b["batch_no"],
+            start=datetime.fromisoformat(b["start_ts"]),
+            end=datetime.fromisoformat(b["end_ts"]),
+        )
+        for b in sorted(head.batches, key=lambda b: b["batch_no"])
+    ]
+
+
+def _allocation_account_out(original, alloc_acc, splits, batch_nos: list[str]):
+    """组装单份损失账的分摊结果：各去向（全部批次 + 未分配）按原因汇总 + 来源明细。"""
+    by_reason_src = original.by_reason or {}
+
+    # 去向键：批次按批次号升序，未分配恒在最后
+    keys: list[tuple[str, str | None]] = [
+        ("batch", bno) for bno in batch_nos
+    ] + [("unallocated", None)]
+    agg: dict[tuple[str, str | None], dict] = {
+        key: {
+            reason: {"priced_minutes": 0, "unpriced_minutes": 0, "amount_cents": 0}
+            for reason in ("maintenance", "failure", "pending")
+        }
+        for key in keys
+    }
+    for sp in splits:
+        bucket = agg[(sp.dest, sp.batch_no)]
+        row = bucket[sp.reason]
+        if sp.priced:
+            row["priced_minutes"] += sp.minutes
+            row["amount_cents"] += sp.amount_cents or 0
+        else:
+            row["unpriced_minutes"] += sp.minutes
+
+    destinations: list[AllocationDestination] = []
+    for dest, batch_no in keys:
+        bucket = agg[(dest, batch_no)]
+        reason_totals = [
+            AllocationReasonTotal(
+                reason=reason,
+                priced_minutes=item["priced_minutes"],
+                unpriced_minutes=item["unpriced_minutes"],
+                amount=format_cents(item["amount_cents"]),
+                amount_cents=item["amount_cents"],
+            )
+            for reason, item in sorted(bucket.items())
+        ]
+        destinations.append(
+            AllocationDestination(
+                dest=dest,
+                batch_no=batch_no,
+                priced_minutes=sum(i["priced_minutes"] for i in bucket.values()),
+                unpriced_minutes=sum(
+                    i["unpriced_minutes"] for i in bucket.values()
+                ),
+                amount=format_cents(
+                    sum(i["amount_cents"] for i in bucket.values())
+                ),
+                amount_cents=sum(i["amount_cents"] for i in bucket.values()),
+                by_reason=reason_totals,
+            )
+        )
+
+    split_outs = [
+        AllocationSplitOut(
+            split_no=sp.split_no,
+            accounting_id=sp.accounting_id,
+            source_piece_no=sp.source_piece_no,
+            seg_no=sp.seg_no,
+            dest=sp.dest,
+            batch_no=sp.batch_no,
+            start=sp.start_ts,
+            end=sp.end_ts,
+            minutes=sp.minutes,
+            reason=sp.reason,
+            priced=sp.priced,
+            amount=format_cents(sp.amount_cents) if sp.priced else None,
+            amount_cents=sp.amount_cents,
+        )
+        for sp in splits
+    ]
+
+    totals = LossTotal(
+        amount=format_cents(original.total_cents),
+        amount_cents=original.total_cents,
+        priced_minutes=original.priced_minutes,
+        unpriced_minutes=original.unpriced_minutes,
+        by_reason=[
+            LossReasonTotal(
+                reason=reason,
+                priced_minutes=item.get("priced_minutes", 0),
+                unpriced_minutes=item.get("unpriced_minutes", 0),
+                amount=format_cents(item.get("amount_cents", 0)),
+                amount_cents=item.get("amount_cents", 0),
+            )
+            for reason, item in sorted(by_reason_src.items())
+        ],
+    )
+    return AllocationAccountResult(
+        accounting_id=alloc_acc.accounting_id,
+        shift_id=alloc_acc.shift_id,
+        revision=alloc_acc.revision,
+        rate_version=alloc_acc.rate_version,
+        totals=totals,
+        destinations=destinations,
+        splits=split_outs,
+    )
+
+
+def _loss_cost_allocation_out(head, rows, idempotent: bool) -> LossCostAllocationOut:
+    batch_nos = [b["batch_no"] for b in sorted(head.batches, key=lambda b: b["batch_no"])]
+    return LossCostAllocationOut(
+        id=head.id,
+        allocation_no=head.allocation_no,
+        device_id=head.device_id,
+        idempotent=idempotent,
+        batch_windows=_batch_windows_out(head),
+        accounts=[
+            _allocation_account_out(original, alloc_acc, splits, batch_nos)
+            for original, alloc_acc, splits in rows
+        ],
+        created_at=head.created_at,
+    )
+
+
+@app.post(
+    "/devices/{device_id}/loss-cost-allocations",
+    response_model=LossCostAllocationOut,
+    tags=["loss-allocation"],
+)
+def allocate_loss_costs_route(
+    device_id: str,
+    payload: LossCostAllocationIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """按生产批次追溯停机成本：把同一设备的已固化损失账按批次窗口分摊并固化。
+
+    - 提交分摊单号、已固化损失账 id 列表与一批"批次号 + 带时区整分钟半开
+      生产窗口"（一批次一窗口，窗口互不重叠、相接允许）；全部损失账须属于
+      路径设备，且每个班次至多引用一份账；
+    - 按账内**已固化**切分明细（定价明细金额已按分取整；待定价明细无金额）
+      与各窗口的半开交集分摊分钟，窗口外分钟归"未分配"；
+    - 定价明细整数分按交集分钟占该明细分钟的比例分配：先取整，余分按小数
+      余数降序补足，同余数批次号升序、未分配最后；各去向金额之和恒等于
+      原明细金额；待定价只分分钟、不产生金额；
+    - 结果固化各账、各去向按原因汇总的分钟/金额及来源明细，历史分摊不随后续
+      归因修订或费率发布改变；同单号同内容重试返回原结果（200，idempotent=true），
+      同单号异内容 409 ALLOCATION_CONFLICT（列表顺序无关同内容判定）；
+    - 未知设备 404 DEVICE_NOT_FOUND；未知/跨设备账 404 LOSS_ACCOUNTING_NOT_FOUND；
+      同班次多账 422 ACCOUNTINGS_SAME_SHIFT；批次号重复/窗口重叠/非法窗口
+      422（BATCH_WINDOW_INVALID / VALIDATION_ERROR）；任一非法整单拒绝不留痕。
+    """
+    if payload.device_id != device_id:
+        raise services.ApiError(
+            422,
+            "VALIDATION_ERROR",
+            f"device_id in body {payload.device_id!r} does not match path {device_id!r}",
+        )
+    head, rows, idempotent = services.allocate_loss_costs(db, payload)
+    response.status_code = 200 if idempotent else 201
+    return _loss_cost_allocation_out(head, rows, idempotent)
+
+
+@app.get(
+    "/loss-cost-allocations/{allocation_no}",
+    response_model=LossCostAllocationOut,
+    tags=["loss-allocation"],
+)
+def get_loss_cost_allocation_route(allocation_no: str, db: Session = Depends(get_db)):
+    """按单号读取固化的按批次停机损失分摊（历史分摊不可改写）。
+
+    未知单号 404 ALLOCATION_NOT_FOUND。
+    """
+    head, rows = services.get_loss_cost_allocation(db, allocation_no)
+    return _loss_cost_allocation_out(head, rows, True)
+
+
+@app.get(
+    "/devices/{device_id}/loss-cost-allocations",
+    response_model=list[LossCostAllocationOut],
+    tags=["loss-allocation"],
+)
+def list_device_loss_cost_allocations_route(
+    device_id: str, db: Session = Depends(get_db)
+):
+    """列出设备的全部固化分摊单（按提交先后；未知设备 404 DEVICE_NOT_FOUND）。"""
+    data = services.list_device_loss_cost_allocations(db, device_id)
+    return [_loss_cost_allocation_out(head, rows, True) for head, rows in data]

@@ -14,7 +14,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import attribution, pricing, reconciliation
+from . import attribution, pricing, reconciliation, allocation
 from .attribution import EventView, RulingView
 from .config import settings
 from .models import (
@@ -24,6 +24,9 @@ from .models import (
     EventVersion,
     LossAccounting,
     LossAccountingPiece,
+    LossCostAllocation,
+    LossCostAllocationAccount,
+    LossCostAllocationSplit,
     ManualAdjudication,
     RateEntry,
     RateVersion,
@@ -1923,3 +1926,316 @@ def list_loss_accountings(
     for accounting in rows:
         out.append((accounting, _accounting_pieces(db, accounting.id)))
     return shift, out
+
+
+# ------------------------------------------------ 停机损失按生产批次分摊
+
+
+def _allocation_content_hash(
+    accounting_ids: list[int], batches: list[tuple[str, datetime, datetime]]
+) -> str:
+    """规范化提交内容 → sha256（与列表顺序无关）。
+
+    账 id 去重升序；批次按批次号升序，窗口端点归一为 UTC 整分钟 ISO 串。
+    """
+    canonical_accounts = sorted(set(accounting_ids))
+    canonical_batches = sorted(
+        ((bno, _utc(s), _utc(e)) for bno, s, e in batches),
+        key=lambda b: b[0],
+    )
+    payload = {
+        "accounting_ids": canonical_accounts,
+        "batches": [
+            {"batch_no": bno, "start": s.isoformat(), "end": e.isoformat()}
+            for bno, s, e in canonical_batches
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def allocate_loss_costs(db: Session, payload) -> tuple[
+    LossCostAllocation,
+    list[
+        tuple[
+            LossAccounting,
+            LossCostAllocationAccount,
+            list[LossCostAllocationSplit],
+        ]
+    ],
+    bool,
+]:
+    """按生产批次窗口把同一设备的已固化损失账分摊到各批次与"未分配"并固化。
+
+    返回 (分摊单头, [(原损失账头, 单内账引用行, 该账全部来源分摊行[按 split_no])],
+    是否幂等)。
+    任一非法（未知设备/账、跨设备账、同班次多账、批次号重复/窗口重叠/非法窗口）
+    整单拒绝，事务回滚，不留部分结果。同单号同内容重试返回原结果；同单号异内容
+    409 ALLOCATION_CONFLICT。
+    """
+    device = get_device_or_404(db, payload.device_id)
+
+    # 规范化并校验批次窗口（应用层给出语义化错误码；schema 已保证整分钟/非空）
+    windows = [
+        allocation.BatchWindow(batch_no=b.batch_no, start=_utc(b.start), end=_utc(b.end))
+        for b in payload.batches
+    ]
+    try:
+        allocation.validate_windows(windows)
+    except allocation.AllocationError as exc:
+        raise ApiError(422, "BATCH_WINDOW_INVALID", str(exc))
+
+    accounting_ids = list(payload.accounting_ids)
+    content_hash = _allocation_content_hash(
+        accounting_ids, [(b.batch_no, b.start, b.end) for b in payload.batches]
+    )
+
+    # 单号行锁：同单号的并发提交串行；先查既有单（同内容幂等 / 异内容冲突）
+    existing = db.execute(
+        select(LossCostAllocation)
+        .where(LossCostAllocation.allocation_no == payload.allocation_no)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.content_hash != content_hash:
+            raise ApiError(
+                409,
+                "ALLOCATION_CONFLICT",
+                f"allocation_no {payload.allocation_no!r} already exists with "
+                "different content",
+            )
+        rows = _allocation_account_rows(db, existing.id)
+        db.commit()  # 释放单号行锁
+        return existing, rows, True
+
+    # 锁引用的损失账行（id 升序，避免死锁）：账不可变，加锁主要与跨单引用及
+    # 潜在清理串行；读取内容与后续写入在同一事务快照内完成。
+    account_rows: list[LossAccounting] = []
+    for accounting_id in sorted(set(accounting_ids)):
+        acc = db.execute(
+            select(LossAccounting)
+            .where(LossAccounting.id == accounting_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+        if acc is None or acc.device_id != device.id:
+            raise ApiError(
+                404,
+                "LOSS_ACCOUNTING_NOT_FOUND",
+                f"device {device.id!r} has no loss accounting id={accounting_id}",
+            )
+        account_rows.append(acc)
+
+    # 每个班次最多选一份账
+    shift_seen: set[int] = set()
+    for acc in account_rows:
+        if acc.shift_id in shift_seen:
+            raise ApiError(
+                422,
+                "ACCOUNTINGS_SAME_SHIFT",
+                f"at most one loss accounting per shift may be allocated in an "
+                f"order; shift id={acc.shift_id} appears more than once",
+            )
+        shift_seen.add(acc.shift_id)
+
+    head = LossCostAllocation(
+        allocation_no=payload.allocation_no,
+        device_id=device.id,
+        content_hash=content_hash,
+        batches=[
+            {
+                "batch_no": b.batch_no,
+                "start_ts": b.start.isoformat(),
+                "end_ts": b.end.isoformat(),
+            }
+            for b in sorted(windows, key=lambda w: w.batch_no)
+        ],
+        accounting_ids=sorted(acc.id for acc in account_rows),
+    )
+    db.add(head)
+    db.flush()  # 取得 head.id
+
+    split_no = 0
+    out_rows: list[
+        tuple[
+            LossAccounting,
+            LossCostAllocationAccount,
+            list[LossCostAllocationSplit],
+        ]
+    ] = []
+    for acc in sorted(account_rows, key=lambda a: a.id):
+        piece_rows = _accounting_pieces(db, acc.id)
+        pieces = [
+            allocation.Piece(
+                piece_no=p.piece_no,
+                seg_no=p.seg_no,
+                start=p.start_ts,
+                end=p.end_ts,
+                reason=p.reason,
+                minutes=p.minutes,
+                priced=p.priced,
+                amount_cents=p.amount_cents,
+            )
+            for p in piece_rows
+        ]
+        result = allocation.allocate_pieces(pieces, windows)
+        ordered_splits = sorted(
+            result.splits,
+            key=lambda s: (s.start, s.end, s.source_piece_no, s.dest, s.batch_no or ""),
+        )
+
+        alloc_acc = LossCostAllocationAccount(
+            allocation_id=head.id,
+            accounting_id=acc.id,
+            shift_id=acc.shift_id,
+            revision=acc.revision,
+            rate_version=acc.rate_version,
+            total_cents=acc.total_cents,
+            priced_minutes=acc.priced_minutes,
+            unpriced_minutes=acc.unpriced_minutes,
+        )
+        db.add(alloc_acc)
+        db.flush()  # 取得 alloc_acc.id 供外键
+
+        stored: list[LossCostAllocationSplit] = []
+        for sp in ordered_splits:
+            split_no += 1
+            row = LossCostAllocationSplit(
+                allocation_id=head.id,
+                alloc_account_id=alloc_acc.id,
+                accounting_id=acc.id,
+                split_no=split_no,
+                source_piece_no=sp.source_piece_no,
+                seg_no=sp.seg_no,
+                dest=sp.dest,
+                batch_no=sp.batch_no,
+                start_ts=sp.start,
+                end_ts=sp.end,
+                reason=sp.reason,
+                minutes=sp.minutes,
+                priced=sp.priced,
+                amount_cents=sp.amount_cents,
+            )
+            db.add(row)
+            stored.append(row)
+        out_rows.append((acc, alloc_acc, stored))
+
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发同单号提交：唯一约束保证只有一单；竞争方转幂等读取
+        db.rollback()
+        winner = db.execute(
+            select(LossCostAllocation).where(
+                LossCostAllocation.allocation_no == payload.allocation_no
+            )
+        ).scalar_one()
+        if winner.content_hash != content_hash:
+            raise ApiError(
+                409,
+                "ALLOCATION_CONFLICT",
+                f"allocation_no {payload.allocation_no!r} already exists with "
+                "different content",
+            )
+        return winner, _allocation_account_rows(db, winner.id), True
+
+    db.refresh(head)
+    return head, out_rows, False
+
+
+def _allocation_account_rows(
+    db: Session, allocation_id: int
+) -> list[
+    tuple[
+        LossAccounting,
+        LossCostAllocationAccount,
+        list[LossCostAllocationSplit],
+    ]
+]:
+    """读取分摊单内各账引用及其全部来源分摊行（账按 accounting_id，行按 split_no）。
+
+    同时回连原损失账头（不可变）以取得按原因合计等账面信息。
+    """
+    accs = list(
+        db.execute(
+            select(LossCostAllocationAccount)
+            .where(LossCostAllocationAccount.allocation_id == allocation_id)
+            .order_by(LossCostAllocationAccount.accounting_id)
+        )
+        .scalars()
+        .all()
+    )
+    out: list[
+        tuple[
+            LossAccounting,
+            LossCostAllocationAccount,
+            list[LossCostAllocationSplit],
+        ]
+    ] = []
+    for aa in accs:
+        original = db.execute(
+            select(LossAccounting).where(LossAccounting.id == aa.accounting_id)
+        ).scalar_one()
+        splits = list(
+            db.execute(
+                select(LossCostAllocationSplit)
+                .where(LossCostAllocationSplit.alloc_account_id == aa.id)
+                .order_by(LossCostAllocationSplit.split_no)
+            )
+            .scalars()
+            .all()
+        )
+        out.append((original, aa, splits))
+    return out
+
+
+def get_loss_cost_allocation(
+    db: Session, allocation_no: str
+) -> tuple[
+    LossCostAllocation,
+    list[
+        tuple[
+            LossAccounting,
+            LossCostAllocationAccount,
+            list[LossCostAllocationSplit],
+        ]
+    ],
+]:
+    """按单号读取固化的分摊结果；未知单号 404 ALLOCATION_NOT_FOUND。"""
+    head = db.execute(
+        select(LossCostAllocation).where(
+            LossCostAllocation.allocation_no == allocation_no
+        )
+    ).scalar_one_or_none()
+    if head is None:
+        raise ApiError(
+            404,
+            "ALLOCATION_NOT_FOUND",
+            f"unknown allocation_no: {allocation_no!r}",
+        )
+    return head, _allocation_account_rows(db, head.id)
+
+
+def list_device_loss_cost_allocations(
+    db: Session, device_id: str
+) -> list[tuple[
+    LossCostAllocation,
+    list[
+        tuple[
+            LossAccounting,
+            LossCostAllocationAccount,
+            list[LossCostAllocationSplit],
+        ]
+    ],
+]]:
+    """列出设备的全部固化分摊单（按 id 升序）；未知设备 404。"""
+    get_device_or_404(db, device_id)
+    heads = list(
+        db.execute(
+            select(LossCostAllocation)
+            .where(LossCostAllocation.device_id == device_id)
+            .order_by(LossCostAllocation.id)
+        )
+        .scalars()
+        .all()
+    )
+    return [(h, _allocation_account_rows(db, h.id)) for h in heads]

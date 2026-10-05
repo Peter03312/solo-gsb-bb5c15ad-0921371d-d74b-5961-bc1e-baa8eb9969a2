@@ -362,7 +362,6 @@ class LossAccountingPiece(Base):
     """
 
     __tablename__ = "loss_accounting_pieces"
-
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     accounting_id: Mapped[int] = mapped_column(
         ForeignKey("loss_accountings.id"), nullable=False, index=True
@@ -393,5 +392,137 @@ class LossAccountingPiece(Base):
             "AND seg_no IS NOT NULL) OR "
             "(NOT priced AND rate_per_minute IS NULL AND amount_cents IS NULL)",
             name="ck_loss_pieces_priced_shape",
+        ),
+    )
+
+
+class LossCostAllocation(Base):
+    """按生产批次窗口分摊停机损失账的固化结果（账头）。
+
+    - 一次提交面向同一设备：device_id + 一个分摊单号 allocation_no，引用该
+      设备的一或多份已固化损失账（每班至多一份）及一批生产批次窗口
+      （一批次一窗口、互不重叠）；
+    - content_hash 为规范化后的提交内容哈希（账 id 升序、批次按批次号升序，
+      时间归一 UTC，列表顺序无关）：同单号同内容重试幂等返回原结果，
+      同单号异内容冲突拒绝；
+    - 账头与其全部来源分摊行同一事务写入；之后只读不重写——后续归因修订、
+      费率发布或重新分摊都不会改变历史分摊。
+    """
+
+    __tablename__ = "loss_cost_allocations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    allocation_no: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    device_id: Mapped[str] = mapped_column(
+        ForeignKey("devices.id"), nullable=False, index=True
+    )
+    # 规范化提交内容哈希（同内容判定，与提交列表顺序无关）
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 提交的批次窗口（规范化、按批次号升序）：
+    # [{"batch_no", "start_ts", "end_ts"}, ...]
+    batches: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # 本单引用的损失账 id（升序）
+    accounting_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class LossCostAllocationAccount(Base):
+    """分摊单内对单份损失账的引用及该账的分钟/金额合计（同事务固化）。"""
+
+    __tablename__ = "loss_cost_allocation_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    allocation_id: Mapped[int] = mapped_column(
+        ForeignKey("loss_cost_allocations.id"), nullable=False, index=True
+    )
+    accounting_id: Mapped[int] = mapped_column(
+        ForeignKey("loss_accountings.id"), nullable=False
+    )
+    shift_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    rate_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    priced_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    unpriced_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "allocation_id", "accounting_id",
+            name="uq_loss_cost_allocation_account",
+        ),
+        CheckConstraint(
+            "total_cents >= 0 AND priced_minutes >= 0 AND unpriced_minutes >= 0",
+            name="ck_loss_cost_alloc_account_totals",
+        ),
+    )
+
+
+class LossCostAllocationSplit(Base):
+    """分摊来源明细：一条损失账切分明细 × 一个去向（某批次或未分配的一段区间）。
+
+    - 与账头同事务写入、之后只读；每行整分钟半开区间 [start_ts, end_ts)；
+    - dest=batch 时 batch_no 为对应批次号；dest=unallocated 时 batch_no 为空；
+    - priced=FALSE（待定价）只分分钟，amount_cents 为空；
+    - 定价行金额为按"交集分钟/明细分钟"最大余数法分摊到去向的整数分
+      （未分配在同明细内有多段时机械拆行，按去向汇总恒等于原明细金额）。
+    """
+
+    __tablename__ = "loss_cost_allocation_splits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    allocation_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    alloc_account_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    accounting_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    split_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_piece_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    seg_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dest: Mapped[str] = mapped_column(String(16), nullable=False)
+    batch_no: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reason: Mapped[str] = mapped_column(String(16), nullable=False)
+    minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    priced: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    amount_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["allocation_id"],
+            ["loss_cost_allocations.id"],
+            name="fk_loss_cost_split_alloc",
+        ),
+        ForeignKeyConstraint(
+            ["alloc_account_id"],
+            ["loss_cost_allocation_accounts.id"],
+            name="fk_loss_cost_split_alloc_account",
+        ),
+        ForeignKeyConstraint(
+            ["accounting_id"],
+            ["loss_accountings.id"],
+            name="fk_loss_cost_split_accounting",
+        ),
+        UniqueConstraint(
+            "allocation_id", "split_no", name="uq_loss_cost_allocation_split"
+        ),
+        CheckConstraint("end_ts > start_ts", name="ck_loss_cost_split_range"),
+        CheckConstraint(
+            "reason IN ('maintenance','failure','pending')",
+            name="ck_loss_cost_split_reason",
+        ),
+        CheckConstraint(
+            "dest IN ('batch','unallocated')", name="ck_loss_cost_split_dest"
+        ),
+        CheckConstraint("minutes > 0", name="ck_loss_cost_split_minutes"),
+        CheckConstraint(
+            "(dest = 'batch' AND batch_no IS NOT NULL) OR "
+            "(dest = 'unallocated' AND batch_no IS NULL)",
+            name="ck_loss_cost_split_dest_shape",
+        ),
+        CheckConstraint(
+            "(priced AND amount_cents IS NOT NULL) OR "
+            "(NOT priced AND amount_cents IS NULL)",
+            name="ck_loss_cost_split_priced_shape",
         ),
     )

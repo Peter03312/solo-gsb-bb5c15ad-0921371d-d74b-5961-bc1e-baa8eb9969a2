@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→费率发布→停机损失核算 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→费率发布→停机损失核算→按批次分摊停机成本 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -245,3 +245,31 @@ req GET "/shifts/1/loss-accountings?revision=1&rate_version=1"
 echo "-- 损失核算错误：未知费率版本 404 / 历史修订无明细 422 SEGMENTS_UNAVAILABLE / 未知班次 404 --"
 req POST /shifts/1/loss-accountings '{"revision":1,"rate_version":999}'
 req POST /shifts/9999/loss-accountings '{"rate_version":1}'
+
+echo "-- 按生产批次分摊停机成本：修订 1 × 费率版本 1 的账（id=2，保养 60×2 + 故障 60×1 = 180.00 元）--"
+echo "-- 批次 B1001 覆盖 10:00-11:00（保养 60 分钟 120.00）、B1002 覆盖 11:00-11:30（故障 30 分钟 30.00），11:30-12:00 归未分配（故障 30 分钟 30.00）--"
+req POST /devices/CNC-01/loss-cost-allocations '{"device_id":"CNC-01","allocation_no":"AL-SMOKE-001","accounting_ids":[2],"batches":[
+  {"batch_no":"B1002","start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T11:30:00+08:00"},
+  {"batch_no":"B1001","start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00"}]}'
+
+echo "-- 同单号同内容重试（列表顺序不影响）：预期 200 幂等，idempotent=true --"
+req POST /devices/CNC-01/loss-cost-allocations '{"device_id":"CNC-01","allocation_no":"AL-SMOKE-001","accounting_ids":[2],"batches":[
+  {"batch_no":"B1001","start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00"},
+  {"batch_no":"B1002","start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T11:30:00+08:00"}]}'
+
+echo "-- 按单号读取固化分摊；列出设备全部分摊单 --"
+req GET /loss-cost-allocations/AL-SMOKE-001
+req GET /devices/CNC-01/loss-cost-allocations
+
+echo "-- 同单号异内容：预期 409 ALLOCATION_CONFLICT（原结果不变）--"
+req POST /devices/CNC-01/loss-cost-allocations '{"device_id":"CNC-01","allocation_no":"AL-SMOKE-001","accounting_ids":[2],"batches":[
+  {"batch_no":"B1001","start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T10:30:00+08:00"}]}'
+
+echo "-- 非法分摊整单拒绝：同班次两份账 422 ACCOUNTINGS_SAME_SHIFT / 批次窗口重叠 422 BATCH_WINDOW_INVALID / 未知账 404 --"
+req POST /devices/CNC-01/loss-cost-allocations '{"device_id":"CNC-01","allocation_no":"AL-SMOKE-BAD1","accounting_ids":[1,2],"batches":[
+  {"batch_no":"B1","start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00"}]}'
+req POST /devices/CNC-01/loss-cost-allocations '{"device_id":"CNC-01","allocation_no":"AL-SMOKE-BAD2","accounting_ids":[2],"batches":[
+  {"batch_no":"B1","start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:30:00+08:00"},
+  {"batch_no":"B2","start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T12:00:00+08:00"}]}'
+req POST /devices/CNC-01/loss-cost-allocations '{"device_id":"CNC-01","allocation_no":"AL-SMOKE-BAD3","accounting_ids":[999],"batches":[
+  {"batch_no":"B1","start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00"}]}'
